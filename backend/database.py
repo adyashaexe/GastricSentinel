@@ -10,7 +10,7 @@ SUPABASE_URL = os.getenv(
     "SUPABASE_URL",
     "https://xqobdsessewpfvzoqngj.supabase.co"
 )
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhxb2Jkc2Vzc2V3cGZ2em9xbmdqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzkzNjI3MSwiZXhwIjoyMDg5NTEyMjcxfQ.LPi1TOV1rcyYNHB_2bTZFxtleTm7O9taXT40RMwRYqI")   # set in your .env / hosting secrets
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")   # set in your .env / hosting secrets
 
 if not SUPABASE_KEY:
     raise EnvironmentError(

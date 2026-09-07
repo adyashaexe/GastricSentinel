@@ -1,0 +1,30 @@
+# Install with: pip install -r requirements.txt
+# Covers: backend (Flask API), training (PyTorch), and explainability (SHAP, Grad-CAM).
+
+# --- Web backend ---
+flask
+flask-cors
+
+# --- Database ---
+supabase
+
+# --- Deep learning ---
+torch
+torchvision
+
+# --- Explainability ---
+shap
+opencv-python          # cv2 — used by shap_explainer.py and gradcam.py
+
+# --- Data / training utilities ---
+numpy
+scikit-learn            # train/val/test splitting, F1 / classification_report
+tqdm                     # training progress bars
+pillow                   # image loading (PIL)
+
+# --- PDF report generation ---
+reportlab
+
+# --- Recommended (not yet used, but you should adopt this given the
+# hardcoded Supabase key issue — load secrets from a .env file instead) ---
+python-dotenv

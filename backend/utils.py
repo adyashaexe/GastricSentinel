@@ -2,7 +2,7 @@ from PIL import Image
 import torch
 from torchvision import transforms
 
-CLASSES = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
+CLASSES = ['ADI', 'BACK', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
 
 
 def get_transform():
@@ -85,6 +85,15 @@ def generate_report(class_index, confidence):
         "MUS": "Smooth Muscle",
         "NORM": "Normal Mucosa"
     }
+
+    if detected_class == "BACK":
+        return {
+            "tier": "INVALID",
+            "color": "GRAY",
+            "diagnosis": "Background / No Tissue Detected",
+            "details": f"Model is {conf_percent:.1f}% confident this region contains no tissue.",
+            "recommendation": "No tissue present in this region. Re-scan or select a different area of the slide."
+        }
 
     if detected_class in friendly_names:
         return {

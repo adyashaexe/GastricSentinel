@@ -56,7 +56,7 @@ TEST_SPLIT = 0.15
 VAL_SPLIT = 0.15
 SEED = 42
 
-CLASSES = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
+CLASSES = ['ADI', 'BACK', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
 MALIGNANT_CLASSES = {'TUM', 'STR'}  # used only to shape synthetic feature distributions
 
 

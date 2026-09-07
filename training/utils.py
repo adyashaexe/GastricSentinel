@@ -2,7 +2,7 @@ from torchvision import transforms
 from PIL import Image
 
 # The exact order matters! It must match the alphabetical order of folders.
-CLASSES = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
+CLASSES = ['ADI', 'BACK', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
 
 def get_transform():
     """
@@ -51,9 +51,10 @@ def generate_report(class_index, confidence):
         }
 
     # --- TIER 3: HEALTHY (Green) ---
-    elif detected_class in ['ADI', 'LYM', 'MUC', 'MUS', 'NORM']:
+    elif detected_class in ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM']:
         friendly_names = {
             'ADI': 'Adipose (Fat)',
+            'DEB': 'Debris / Cellular Fragments',
             'LYM': 'Lymphocytes (Immune Cells)',
             'MUC': 'Mucosa (Stomach Lining)',
             'MUS': 'Smooth Muscle',
@@ -68,6 +69,15 @@ def generate_report(class_index, confidence):
         }
 
     # --- TIER 4: INVALID (Gray) ---
+    elif detected_class == 'BACK':
+        return {
+            "tier": "INVALID",
+            "color": "⚪ GRAY",
+            "diagnosis": "Background / No Tissue Detected",
+            "details": f"Model is {conf_percent:.1f}% confident this region contains no tissue.",
+            "recommendation": "No tissue present. Re-scan or select a different area of the slide."
+        }
+
     else:
         return {
             "tier": "INVALID",

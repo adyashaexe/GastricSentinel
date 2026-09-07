@@ -27,7 +27,7 @@ VAL_SPLIT = 0.15          # of the *remaining* data after the test split is carv
 SEED = 42
 
 # 8 Classes
-CLASSES = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
+CLASSES = ['ADI', 'BACK', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
 
 
 def get_data_loaders():

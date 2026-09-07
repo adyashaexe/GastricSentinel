@@ -1,21 +1,30 @@
 import os
+import json
+import copy
+import time
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, models, transforms
 from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, classification_report
 from tqdm import tqdm
-import time
 
 # --- CONFIGURATION ---
 DATA_PATH = os.path.join('cancer_project', 'raw')  # Update this to your actual data path
 MODEL_SAVE_PATH = os.path.join('models', 'gastric_resnet50.pth')
+REPORT_SAVE_PATH = os.path.join('models', 'test_report.json')
 
 BATCH_SIZE = 32
-EPOCHS = 15
-LEARNING_RATE = 0.0001
-VAL_SPLIT = 0.2
+MAX_EPOCHS = 100          # upper bound; early stopping will usually cut this short
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+PATIENCE = 10             # early-stopping patience, measured on val macro-F1
+TEST_SPLIT = 0.15
+VAL_SPLIT = 0.15          # of the *remaining* data after the test split is carved out
+SEED = 42
 
 # 8 Classes
 CLASSES = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
@@ -24,7 +33,6 @@ CLASSES = ['ADI', 'DEB', 'LYM', 'MUC', 'MUS', 'NORM', 'STR', 'TUM']
 def get_data_loaders():
     print("Preparing Data...")
 
-    # 1. Define Transforms
     train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.RandomHorizontalFlip(),
@@ -35,125 +43,163 @@ def get_data_loaders():
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    val_transform = transforms.Compose([
+    eval_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    # 2. Load Dataset TWICE (Bulletproof strategy)
-    # We load the same data folder twice, but attach different transforms to each.
-    # This avoids all the complex class inheritance bugs.
-    full_train_dataset = datasets.ImageFolder(DATA_PATH, transform=train_transform)
-    full_val_dataset = datasets.ImageFolder(DATA_PATH, transform=val_transform)
+    # Load the dataset three times with different transforms attached, then
+    # slice each with the *same* indices — avoids custom Dataset subclassing.
+    train_backing = datasets.ImageFolder(DATA_PATH, transform=train_transform)
+    val_backing = datasets.ImageFolder(DATA_PATH, transform=eval_transform)
+    test_backing = datasets.ImageFolder(DATA_PATH, transform=eval_transform)
 
-    # 3. Create the Split Indices
-    # We use the targets from one of them to ensure stratified splitting
-    train_idx, val_idx = train_test_split(
-        list(range(len(full_train_dataset))),
-        test_size=VAL_SPLIT,
-        stratify=full_train_dataset.targets
+    all_idx = list(range(len(train_backing)))
+    targets = train_backing.targets
+
+    # 1st split: carve out the held-out test set (stratified)
+    trainval_idx, test_idx = train_test_split(
+        all_idx, test_size=TEST_SPLIT, stratify=targets, random_state=SEED
     )
 
-    # 4. Create Subsets
-    # We pass the specific indices to the specific dataset version
-    train_ds = Subset(full_train_dataset, train_idx)
-    val_ds = Subset(full_val_dataset, val_idx)
+    # 2nd split: train vs val, stratified on the remaining data
+    trainval_targets = [targets[i] for i in trainval_idx]
+    train_idx, val_idx = train_test_split(
+        trainval_idx, test_size=VAL_SPLIT, stratify=trainval_targets, random_state=SEED
+    )
 
-    # 5. Create Loaders
-    # We set num_workers=0 temporarily to maximize compatibility on your CPU setup.
-    # If this works, you can try changing it back to 2 or 4 later for speed.
+    train_ds = Subset(train_backing, train_idx)
+    val_ds = Subset(val_backing, val_idx)
+    test_ds = Subset(test_backing, test_idx)
+
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    print(f"Data Loaded: {len(train_ds)} Training images, {len(val_ds)} Validation images.")
-    return train_loader, val_loader
+    print(f"Data Loaded: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test "
+          f"({len(train_ds)+len(val_ds)+len(test_ds)} total)")
+    return train_loader, val_loader, test_loader
+
+
+def build_model():
+    model = models.resnet50(weights='IMAGENET1K_V1')
+
+    # Freeze everything first...
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # ...then unfreeze layer4 (the last residual block) + the new head.
+    # Full end-to-end fine-tuning risks overfitting on a small histology
+    # dataset; unfreezing just the last block is a much better accuracy/
+    # overfitting tradeoff than a fully frozen backbone.
+    for param in model.layer4.parameters():
+        param.requires_grad = True
+
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, len(CLASSES))
+    for param in model.fc.parameters():
+        param.requires_grad = True
+
+    return model
+
+
+def run_epoch(model, loader, criterion, optimizer, device, train: bool):
+    model.train() if train else model.eval()
+
+    running_loss = 0.0
+    all_preds, all_labels = [], []
+
+    context = torch.enable_grad() if train else torch.no_grad()
+    with context:
+        for inputs, labels in tqdm(loader, desc="Training" if train else "Evaluating"):
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            if train:
+                optimizer.zero_grad()
+
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            if train:
+                loss.backward()
+                optimizer.step()
+
+            running_loss += loss.item() * inputs.size(0)
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labels.cpu().tolist())
+
+    epoch_loss = running_loss / len(loader.dataset)
+    epoch_f1 = f1_score(all_labels, all_preds, average='macro')
+    return epoch_loss, epoch_f1, all_labels, all_preds
 
 
 def train_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Compute Device: {device}")
 
-    train_loader, val_loader = get_data_loaders()
+    train_loader, val_loader, test_loader = get_data_loaders()
 
-    print("Initializing ResNet50...")
-    model = models.resnet50(weights='IMAGENET1K_V1')
-
-    # Freeze layers
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # Replace Head
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, len(CLASSES))
-
-    model = model.to(device)
+    print("Initializing ResNet50 (layer4 + fc unfrozen)...")
+    model = build_model().to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.fc.parameters(), lr=LEARNING_RATE)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
 
-    best_acc = 0.0
+    best_f1 = 0.0
+    best_state = None
+    epochs_without_improvement = 0
     start_time = time.time()
 
-    for epoch in range(EPOCHS):
-        print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+    for epoch in range(MAX_EPOCHS):
+        print(f"\nEpoch {epoch + 1}/{MAX_EPOCHS} (lr={scheduler.get_last_lr()[0]:.2e})")
         print("-" * 10)
 
-        # --- Training Phase ---
-        model.train()
-        running_loss = 0.0
-        running_corrects = 0
+        train_loss, train_f1, _, _ = run_epoch(model, train_loader, criterion, optimizer, device, train=True)
+        print(f"Train Loss: {train_loss:.4f}  Macro-F1: {train_f1:.4f}")
 
-        for inputs, labels in tqdm(train_loader, desc="Training"):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+        val_loss, val_f1, _, _ = run_epoch(model, val_loader, criterion, optimizer, device, train=False)
+        print(f"Val   Loss: {val_loss:.4f}  Macro-F1: {val_f1:.4f}")
 
-            optimizer.zero_grad()
+        scheduler.step()
 
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            loss = criterion(outputs, labels)
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data)
-
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_acc = running_corrects.double() / len(train_loader.dataset)
-        print(f"Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
-
-        # --- Validation Phase ---
-        model.eval()
-        val_loss = 0.0
-        val_corrects = 0
-
-        with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc="Validating"):
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-
-                outputs = model(inputs)
-                _, preds = torch.max(outputs, 1)
-                loss = criterion(outputs, labels)
-
-                val_loss += loss.item() * inputs.size(0)
-                val_corrects += torch.sum(preds == labels.data)
-
-        val_loss = val_loss / len(val_loader.dataset)
-        val_acc = val_corrects.double() / len(val_loader.dataset)
-        print(f"Val Loss:   {val_loss:.4f} Acc: {val_acc:.4f}")
-
-        if val_acc > best_acc:
-            best_acc = val_acc
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
             os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
-            torch.save(model.state_dict(), MODEL_SAVE_PATH)
-            print(f"⭐️ Model Improved! Saved to {MODEL_SAVE_PATH}")
+            torch.save(best_state, MODEL_SAVE_PATH)
+            print(f"Model improved (val macro-F1={val_f1:.4f}). Saved to {MODEL_SAVE_PATH}")
+        else:
+            epochs_without_improvement += 1
+            print(f"No improvement for {epochs_without_improvement}/{PATIENCE} epochs.")
+            if epochs_without_improvement >= PATIENCE:
+                print(f"\nEarly stopping triggered at epoch {epoch + 1}.")
+                break
 
     total_time = time.time() - start_time
     print(f"\nTraining Complete in {total_time // 60:.0f}m {total_time % 60:.0f}s")
-    print(f"Best Validation Accuracy: {best_acc:.4f}")
+    print(f"Best Validation Macro-F1: {best_f1:.4f}")
+
+    # --- Final, one-time evaluation on the held-out TEST set ---
+    print("\nEvaluating best checkpoint on held-out test set...")
+    model.load_state_dict(best_state)
+    test_loss, test_f1, test_labels, test_preds = run_epoch(
+        model, test_loader, criterion, optimizer, device, train=False
+    )
+    report = classification_report(
+        test_labels, test_preds, target_names=CLASSES, output_dict=True, zero_division=0
+    )
+    print(f"Test Loss: {test_loss:.4f}  Test Macro-F1: {test_f1:.4f}")
+    print(classification_report(test_labels, test_preds, target_names=CLASSES, zero_division=0))
+
+    os.makedirs(os.path.dirname(REPORT_SAVE_PATH), exist_ok=True)
+    with open(REPORT_SAVE_PATH, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"Full test report saved to {REPORT_SAVE_PATH} — these are the numbers to cite in the paper.")
 
 
 if __name__ == "__main__":

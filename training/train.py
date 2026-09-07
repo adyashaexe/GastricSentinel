@@ -135,8 +135,16 @@ def run_epoch(model, loader, criterion, optimizer, device, train: bool):
     return epoch_loss, epoch_f1, all_labels, all_preds
 
 
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def train_model():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"Compute Device: {device}")
 
     train_loader, val_loader, test_loader = get_data_loaders()

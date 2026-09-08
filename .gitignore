@@ -1,24 +1,29 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environment
+*.py[cod]
 venv/
-.env/
+.venv/
 
-# Dataset
-training/raw/
-training/data/
+# macOS
+.DS_Store
 
-# Model weights (optional if large)
+# VS Code
+.vscode/
+
+# Environment
+.env
+
+# Data
+data/
+
+# Models
+*.pkl
+*.joblib
 *.pth
 *.pt
+*.ckpt
+*.onnx
 
-# OS files
-.DS_Store
-Thumbs.db
-
-# VSCode settings
-.vscode/
+# Reports / logs
+*.log
+*_report.json

@@ -65,6 +65,9 @@ def load_image_model():
 
 
 def get_images():
+    # Label indices must match how train.py's ImageFolder assigned them:
+    # alphabetical order -> Abnormal=0, Normal=1. (Previously this was
+    # hardcoded backwards, which silently inverted every prediction.)
     normal = []
     abnormal = []
 
@@ -89,11 +92,11 @@ def get_images():
     normal = normal[:n]
     abnormal = abnormal[:n]
 
-    paths = normal + abnormal
-    labels = [0] * len(normal) + [1] * len(abnormal)
+    paths = abnormal + normal
+    labels = [0] * len(abnormal) + [1] * len(normal)
 
     print(f"Using image subset: {len(paths)}")
-    print(f"Normal: {len(normal)} | Abnormal: {len(abnormal)}")
+    print(f"Abnormal: {len(abnormal)} | Normal: {len(normal)}")
 
     return paths, np.asarray(labels)
 
@@ -304,8 +307,8 @@ def main():
         "image_model": IMAGE_MODEL_PATH,
         "genomic_clinical_model": GENOMIC_MODEL_PATH,
         "image_classes": [
-            "Normal",
-            "Abnormal"
+            "Abnormal",
+            "Normal"
         ],
         "genomic_classes": classes,
         "image_threshold": 0.5

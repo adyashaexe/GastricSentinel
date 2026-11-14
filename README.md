@@ -1,144 +1,454 @@
-# GastricSentinel (rebuilt)
+# GastricSentinel
 
-Multimodal gastric cancer analysis **research prototype**: ResNet-50 tissue classifier, TCGA-STAD clinical/genomic models, a modality-aware fusion head, Grad-CAM + SHAP explanations, a small Flask app and PDF reports.
+**AI-assisted multimodal analysis of gastric histopathology: tissue classification, explainability, clinical/genomic context, and a documented report that states its own limits.**
 
-This rebuild replaces a codebase whose pieces disagreed with each other (see `docs/AUDIT.md`). Every number it prints comes from one code path, with the split, pairing and averaging choices written to disk.
+> **Research prototype.** Not clinically validated, not a medical device, and not for diagnosis or treatment decisions. A pathologist must review every output.
 
-> Not clinically validated. Not for diagnosis or treatment decisions.
+GastricSentinel takes an H&E image patch (optionally with age, sex, stage and a gene-expression file) and returns:
 
-## What is in here
+- a **tissue class** with a calibrated confidence and an explicit low-confidence flag;
+- a **Grad-CAM** map of where the image model looked;
+- a **molecular-subtype estimate** from clinical and gene-expression inputs, with **SHAP** feature attributions;
+- an **experimental fusion** result, clearly labelled as such;
+- a multi-page **PDF report** with inputs, charts, validation figures, limitations and a reviewer sign-off block;
+- a built-in **assistant** that explains the result in plain language (and refuses to diagnose).
 
-```
-gastricsentinel/
-  data_images.py     manifest, GROUP-aware split (refuses to split without patient/slide IDs)
-  leakage_audit.py   group-overlap + perceptual-hash near-duplicate check across splits
-  data_tabular.py    TCGA-STAD loaders; preprocessor fit on training patients only
-  pairing.py         image <-> TCGA record pairing (random | matched), written to pairing_manifest.csv
-  models.py          ResNet-50, tabular encoders, FusionNet with modality dropout
-  metrics.py         one confusion matrix -> accuracy, macro/weighted P/R/F1, per-class table, CI
-  train_image.py     image classifier
-  train_tabular.py   patient-level subtype models (clinical-only, genomic+clinical), 5-fold CV
-  train_fusion.py    fusion head + modality ablation table
-  explain.py         Grad-CAM (images), SHAP TreeExplainer (clinical/genomic features)
-  inference.py       Predictor with input validation and modality fallback
-  report_pdf.py      PDF report
-app/                 Flask UI + API (python -m app.app)
-scripts/make_synthetic_data.py   fake data in the real file layouts, for smoke tests only
-tests/test_pipeline.py           unit + end-to-end tests
-docs/AUDIT.md                    what was inconsistent in the original repo
-docs/CAMERA_READY_CHECKLIST.md   reviewer comment -> what to change in the paper
-```
+This repository is a ground-up rebuild of an earlier version. The rebuild fixes the methodological problems that a peer review raised: undefined modality pairing, inconsistent metrics, possible train/test leakage, and unvalidated risk and explainability claims. See [What changed and why](#what-changed-and-why).
 
-## Install
+---
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pytest -q tests/        # ~1 min, uses synthetic data, no downloads
-```
+## Contents
 
-## Data layout
+1. [Quick start](#quick-start)
+2. [Project layout](#project-layout)
+3. [Data you need](#data-you-need)
+4. [Training](#training)
+5. [Running the web app](#running-the-web-app)
+6. [Using the interface](#using-the-interface)
+7. [The assistant](#the-assistant)
+8. [Outputs and artifacts](#outputs-and-artifacts)
+9. [How the methodology works](#how-the-methodology-works)
+10. [Configuration](#configuration)
+11. [Tests](#tests)
+12. [Docker](#docker)
+13. [Troubleshooting](#troubleshooting)
+14. [What changed and why](#what-changed-and-why)
+15. [Limitations](#limitations)
+16. [Reporting results honestly](#reporting-results-honestly)
 
-```
-data/images/<CLASS_NAME>/*.png                      # image dataset, one folder per class
-data/clinical/clinical.tsv                          # GDC clinical export (TCGA-STAD)
-data/genomics/TCGA.STAD.sampleMap_HiSeqV2_PANCAN    # UCSC Xena expression (genes x samples)
-data/clinical/stad_tcga_pan_can_atlas_2018_clinical_data.tsv   # cBioPortal (Patient ID, Subtype)
-```
+---
 
-Class names come from the folder names and are stored inside the checkpoint; nothing is hard-coded.
+## Quick start
 
-## Run
+Requires **Python 3.10+**. On macOS and recent Linux you must use a virtual environment (system Python refuses `pip install`).
 
 ```bash
-# 1. Image classifier. Needs patient/slide IDs for a leakage-free split:
-python -m gastricsentinel.train_image --data-dir data/images \
-    --group-regex "^(PATIENT_ID_PATTERN)_" --out-dir artifacts/image
-#    or: --manifest my_manifest.csv   (columns: path,label,group)
+git clone <your-repo-url> GastricSentinel
+cd GastricSentinel
 
-# 2. Patient-level subtype models (cross-validated)
+python3 -m venv .venv
+source .venv/bin/activate
+which python                      # must end in .../GastricSentinel/.venv/bin/python
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Use `python -m pip`, not bare `pip`, so you can never install into the wrong interpreter. Re-run `source .venv/bin/activate` in every new terminal.
+
+**Try it without any real data** (synthetic images and tables, a few minutes on CPU):
+
+```bash
+python scripts/make_synthetic_data.py --out data_demo
+python -m pytest -q tests          # end-to-end test, ~2 minutes
+```
+
+**Run it on real data:** see [Data you need](#data-you-need) and [Training](#training), then:
+
+```bash
+python -m app.app                  # http://127.0.0.1:5000
+```
+
+---
+
+## Project layout
+
+```
+GastricSentinel/
+├── app/                        Flask web app
+│   ├── app.py                  routes, rate limiting, upload retention
+│   ├── templates/index.html    single-page UI
+│   └── static/
+│       ├── css/app.css         themed, responsive styles
+│       └── js/
+│           ├── app.js          analysis flow, result rendering, evidence panel
+│           ├── chat.js         floating assistant
+│           ├── fx.js           theme toggle, reveal-on-scroll, effects
+│           └── bg.js           animated histology background
+├── gastricsentinel/            the Python package
+│   ├── config.py               paths, constants, tissue names, disclaimer
+│   ├── common.py               seeding, device selection, JSON helpers
+│   ├── data_images.py          image dataset, group-aware splitting
+│   ├── leakage_audit.py        near-duplicate (perceptual-hash) audit across splits
+│   ├── data_tabular.py         clinical/genomic loading + leakage-safe preprocessor
+│   ├── pairing.py              patient-disjoint image <-> tabular pairing + disclosure
+│   ├── models.py               ResNet-50 classifier, FusionNet
+│   ├── metrics.py              one-confusion-matrix metrics, bootstrap CIs, ECE
+│   ├── train_image.py          image model training + temperature calibration
+│   ├── train_tabular.py        subtype models (clinical-only, genomic+clinical)
+│   ├── train_fusion.py         modality-dropout fusion + ablation table
+│   ├── explain.py              Grad-CAM, SHAP
+│   ├── inference.py            Predictor: validation, fallbacks, predictions
+│   ├── model_card.py           reads validation artifacts for the UI and PDF
+│   ├── report_pdf.py           multi-page PDF report
+│   └── chat.py                 assistant (offline rules, optional LLM)
+├── scripts/make_synthetic_data.py
+├── tests/test_pipeline.py
+├── docs/
+│   ├── AUDIT.md                what was wrong in the original and how it was fixed
+│   └── CAMERA_READY_CHECKLIST.md
+├── Dockerfile
+├── requirements.txt
+└── README.md
+```
+
+Folders created when you run things (all git-ignored): `data/`, `artifacts/`, `app/static/outputs/`.
+
+---
+
+## Data you need
+
+Nothing is downloaded automatically. Put your data under `data/` (any location works; you pass paths on the command line).
+
+### Images (tissue classification)
+
+One folder per class, containing image files:
+
+```
+data/images/HMU-GC-HE-30K/
+├── ADI/  DEB/  LYM/  MUC/  MUS/  NOR/  STR/  TUM/
+```
+
+Class names are **discovered from the folder names** and stored inside the trained checkpoint, so training and serving can never disagree. Supported types: PNG, JPEG, BMP, TIFF.
+
+Sources used during development:
+
+| Dataset | Use | Notes |
+|---|---|---|
+| **HMU-GC-HE-30K** | main gastric H&E patch dataset | 8 tissue classes. Filenames such as `TUM_1.png` carry **no patient ID**. See the patient-level split note below. |
+| **GasHisSDB** | possible external test set | gastric, normal vs abnormal only |
+| **TCGA-STAD slides** (GDC) | the only route to truly patient-matched fusion | requires tiling slides into patches yourself |
+
+### Clinical, genomic and subtype labels (TCGA-STAD)
+
+| File | Source | Used for |
+|---|---|---|
+| `clinical.tsv` (GDC export) | GDC clinical download | age, sex, stage |
+| `TCGA.STAD.sampleMap_HiSeqV2_PANCAN` | UCSC Xena TCGA-STAD hub | gene expression (genes × samples) |
+| `stad_tcga_pan_can_atlas_2018_clinical_data.tsv` | cBioPortal PanCancer Atlas 2018 | molecular subtype labels (`Patient ID`, `Subtype`) |
+
+Patients are joined on the 12-character TCGA barcode. Only primary-tumour samples (`-01`) are used.
+
+### Patient-level splits: read this
+
+A leakage-safe image split needs a **group ID** (patient or slide) for every image. The trainer **refuses to run** without one unless you pass `--allow-patch-level-split`. If your filenames contain an ID, pass `--group-regex` (its first group is the ID). If they do not, as in HMU-GC-HE-30K, you must use the patch-level flag, and the run is then stamped `leakage_risk` in its outputs, in the web UI and in the PDF.
+
+---
+
+## Training
+
+Run from the project root with the virtual environment active. Three steps; each writes to its own folder under `artifacts/`.
+
+### 1. Image model (ResNet-50)
+
+```bash
+python -m gastricsentinel.train_image \
+  --data-dir data/images/HMU-GC-HE-30K \
+  --allow-patch-level-split \
+  --out-dir artifacts/image \
+  --epochs 20 --batch-size 32 --image-size 224 \
+  --trainable all --class-weights --num-workers 2
+```
+
+If your files carry a patient ID, drop the patch-level flag and add e.g. `--group-regex "^([A-Za-z0-9]+)_"`.
+
+Useful flags:
+
+| Flag | Meaning |
+|---|---|
+| `--trainable {fc,layer4,all}` | how much of the network is fine-tuned (default `layer4`) |
+| `--class-weights` | weight the loss for class imbalance |
+| `--max-per-class N` | cap images per class, for a fast trial run |
+| `--epochs`, `--patience` | training length and early-stopping patience |
+| `--lr`, `--weight-decay` | optimiser settings |
+| `--manifest file.csv` | explicit `path,label,group` table instead of folders |
+| `--no-pretrained` | skip ImageNet weights (offline or smoke tests) |
+
+A quick trial (about 10–15 minutes on an Apple-silicon Mac):
+
+```bash
+python -m gastricsentinel.train_image --data-dir data/images/HMU-GC-HE-30K \
+  --allow-patch-level-split --epochs 5 --max-per-class 1000 --batch-size 32 \
+  --trainable layer4 --class-weights --num-workers 2
+```
+
+Device is chosen automatically: CUDA, then Apple MPS, then CPU. On MPS errors, prefix the command with `PYTORCH_ENABLE_MPS_FALLBACK=1`. A full run on CPU or a laptop GPU takes hours; a free Colab or Kaggle GPU takes well under an hour.
+
+### 2. Clinical and genomic subtype models
+
+```bash
 python -m gastricsentinel.train_tabular \
-    --clinical-tsv data/clinical/clinical.tsv \
-    --expression data/genomics/TCGA.STAD.sampleMap_HiSeqV2_PANCAN \
-    --subtypes data/clinical/stad_tcga_pan_can_atlas_2018_clinical_data.tsv
-
-# 3. Fusion + ablations
-python -m gastricsentinel.train_fusion --image-dir artifacts/image \
-    --clinical-tsv data/clinical/clinical.tsv \
-    --expression data/genomics/TCGA.STAD.sampleMap_HiSeqV2_PANCAN \
-    --subtypes data/clinical/stad_tcga_pan_can_atlas_2018_clinical_data.tsv \
-    --pairing random            # or: matched (see below)
-
-# 4. App
-python -m app.app               # http://127.0.0.1:5000
+  --clinical-tsv data/clinical/extracted/clinical.tsv \
+  --expression data/genomics/TCGA.STAD.sampleMap_HiSeqV2_PANCAN \
+  --subtypes data/clinical/stad_tcga_pan_can_atlas_2018_clinical_data.tsv \
+  --out-dir artifacts/tabular
 ```
 
-Outputs land in `artifacts/`: `*_metrics.json`, `*_per_class.csv`, `*_confusion_matrix.{csv,png}`, `*_summary.md`, `splits.csv`, `leakage_audit.json`, `pairing_manifest.csv`, `pairing_summary.json`, `ablation_table.csv`.
+Trains a **clinical-only** and a **genomic+clinical** random forest and reports 5-fold cross-validated metrics. Subtypes with fewer patients than folds are listed and excluded, never silently merged.
 
-## Things you must decide / state honestly
+### 3. Fusion (experimental)
 
-**Patient-level splits.** If your image files carry no patient or slide ID (names like `TUM_8.png`), a leakage-free split cannot be made from the files alone. Look for a metadata file with slide/patient IDs. If none exists, use `--allow-patch-level-split`; every report is then flagged `leakage_risk: true` and the paper must say so. `leakage_audit.json` still measures how many test images have a near-duplicate in train.
+```bash
+python -m gastricsentinel.train_fusion \
+  --image-dir artifacts/image \
+  --clinical-tsv data/clinical/extracted/clinical.tsv \
+  --expression data/genomics/TCGA.STAD.sampleMap_HiSeqV2_PANCAN \
+  --subtypes data/clinical/stad_tcga_pan_can_atlas_2018_clinical_data.tsv \
+  --pairing random
+```
 
-**Pairing.** Image datasets (e.g. HMU-GC-HE-30K) and TCGA-STAD are different cohorts with no shared IDs.
-- `--pairing matched`: images are tiles from TCGA-STAD slides, `group` = TCGA barcode. Real correspondence.
-- `--pairing random`: each image gets a random TCGA patient from the same split, independent of its label (patient-disjoint across splits). This is a **control**: fusion should not beat image-only, and any claim of multimodal benefit needs `matched` data.
+`--pairing random` attaches each image to an **unrelated** TCGA patient. This is a *control experiment*: the clinical and genomic inputs are noise from the image's point of view, so **no gain over the image-only baseline is expected, and none should be claimed**. Use `--pairing matched` only when you have a manifest linking each patch to its real patient.
 
-The class-conditional pairing (e.g. tumour images paired with tumour-patient records) is deliberately not implemented: it injects label information into the tabular input and inflates accuracy.
+The step writes an ablation table comparing image-only, image+clinical, image+genomic and all three, each with a 95% confidence interval.
 
-**Which baseline.** For the effect of the tabular inputs, compare `fusion image_only` with `fusion image_clinical_genomic` in `ablation_table.csv`. The row `image_model_head` is the separately trained softmax head, kept for reference only.
+---
 
-## Serving behaviour
+## Running the web app
 
-- Image is required; age/sex/stage and a gene-expression CSV (`gene,value`) are optional.
-- Genomic input counts as present only if it covers at least 50% of the model's genes; otherwise it is ignored and a warning is returned.
-- The response lists exactly which modalities were used.
-- The primary prediction is image-based. Fusion output is shown as "experimental" unless the fusion model was trained with `--pairing matched`.
-- "Tumour-class probability" is the model's softmax mass on the `TUM` class. It is not a calibrated clinical risk.
-- Uploaded images and results are stored under `app/static/outputs/`; clear that folder if handling anything sensitive. The app binds to 127.0.0.1 and is not hardened for public deployment.
-- `.pt`/`.joblib` files are pickles: only load artifacts you trained yourself.
+```bash
+python -m app.app
+```
 
-## Front end and assistant
+Open **http://127.0.0.1:5000**. The app needs at least `artifacts/image/image_model.pt`. Without it, the page loads but shows "Models not loaded". Subtype and fusion features switch on automatically when their artifacts exist.
 
-The UI is a single page with no external assets (works offline): animated aurora + interactive particle background, 3D-tilt glass cards, scan-laser while analysing, animated confidence gauge and probability bars, a drag-to-compare Grad-CAM slider, animated SHAP bars and a chat widget. All animation is switched off under the OS "reduce motion" setting.
+For anything beyond local use, run it behind gunicorn (see [Docker](#docker)). The built-in server is for development.
 
-The assistant explains the current result, Grad-CAM, SHAP, confidence and limitations, and refuses diagnosis/treatment questions.
-- Default: built-in offline assistant, no key needed.
-- Optional LLM: set `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`) and optionally `CHAT_MODEL` in the environment. Keys are never written to code or disk. Any provider error silently falls back to the offline assistant. Note that with an LLM key set, the result summary and your question are sent to that provider.
-- `/api/predict` and `/api/chat` are rate-limited per IP; stored uploads are deleted after `RETENTION_HOURS` (default 24).
+---
 
-## Calibration
+## Using the interface
 
-`train_image` fits a temperature on the validation split and reports ECE before/after on the test split (`test_summary.md`). The app's confidence uses the calibrated probabilities.
+One scrolling page, responsive from phone to widescreen, with a light/dark toggle in the header.
+
+| Section | What it does |
+|---|---|
+| **Hero** | live microscope visual; real validation numbers pulled from your trained models |
+| **Try it** | drop an image; optionally add age, sex, stage and a gene-expression file; run the analysis |
+| **Your result** | appears after you run an analysis: plain-language summary, confidence gauge, class probabilities, Grad-CAM before/after slider, subtype estimate and SHAP, fusion result, the inputs that were used, PDF download |
+| **How it works** | the pipeline, as a diagram |
+| **Evidence** | held-out metrics, per-class table, leakage audit, subtype and fusion validation, and the limitations |
+| **Assistant** | floating button, bottom-right (full-width sheet on phones) |
+
+Details worth knowing:
+
+- Only the image is required. Anything left out is skipped and **named as skipped** in the results and the PDF.
+- A gene-expression file is two columns, `gene,value` (CSV or TSV, header optional). It is used only if it covers at least half of the model's genes; otherwise it is ignored and you are told.
+- Recent analyses from this browser appear under the form for quick re-opening. Server copies are deleted after the retention period (default 24 hours), and expired entries remove themselves from the list.
+- The theme follows your system setting until you choose one; the choice is remembered. Animations respect the system "reduce motion" setting.
+
+### PDF report
+
+`/report/<id>` (the **Download the PDF report** button) produces a multi-page document:
+
+1. Summary of findings with the plain-language reading and any warnings
+2. Inputs supplied (and which were omitted)
+3. Image analysis: probability chart, input image and Grad-CAM, how to read the map
+4. Clinical and genomic analysis: subtype probabilities and SHAP chart
+5. Experimental fusion status
+6. Model validation: per-class table, confusion matrix, split and leakage audit, near-duplicate statistics, subtype-model and fusion-pairing disclosure
+7. Limitations
+8. Methods summary
+9. A reviewer sign-off block
+
+### HTTP endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/` | the UI |
+| GET | `/api/status` | which models are loaded |
+| POST | `/api/predict` | multipart: `image` (required), `age`, `sex`, `stage`, `genomic_csv` |
+| GET | `/api/result/<id>` | a stored result (ID is validated; 404 if expired) |
+| GET | `/api/model-card` | validation facts read from the artifacts |
+| POST | `/api/chat` | assistant; body `{message, result_id, history}` |
+| GET | `/report/<id>` | PDF report |
+| GET | `/outputs/<name>` | stored input / Grad-CAM image (filename pattern is validated) |
+
+---
+
+## The assistant
+
+A small chat window in the bottom-right corner. It explains the loaded result (class, confidence, Grad-CAM, SHAP, modalities, report, limitations) in plain language. It **refuses to diagnose or advise on treatment**.
+
+- **Offline mode (default):** a rule-based assistant; no network, no keys.
+- **Language-model mode:** set an API key in the environment before starting the server:
+
+```bash
+export ANTHROPIC_API_KEY=...     # or OPENAI_API_KEY=...
+export CHAT_MODEL=...            # optional override
+python -m app.app
+```
+
+If the model call fails for any reason, it falls back to offline mode automatically. The page shows which mode answered.
+
+---
+
+## Outputs and artifacts
+
+Everything lands under `artifacts/`:
+
+```
+artifacts/
+├── image/
+│   ├── image_model.pt               model weights, class names, calibration temperature
+│   ├── test_metrics.json            accuracy, balanced accuracy, macro P/R/F1, ECE, 95% CIs
+│   ├── test_summary.md              the same, readable
+│   ├── test_per_class.csv
+│   ├── test_confusion_matrix.csv    and .png
+│   ├── test_predictions.csv         every test prediction
+│   ├── history.csv                  per-epoch curves
+│   ├── splits.csv                   which image went to train / val / test
+│   ├── split_info.json              split mode and the leakage_risk flag
+│   └── leakage_audit.json           near-duplicate counts, test vs train
+├── tabular/
+│   ├── clinical_only.joblib         subtype models used by the app
+│   ├── genomic_clinical.joblib
+│   ├── *_metrics.json, *_per_class.csv, *_confusion_matrix.*   cross-validated results
+│   └── tabular_info.json            classes, patient count, excluded rare classes
+└── fusion/
+    ├── fusion_model.pt, fusion_preprocessor.joblib
+    ├── pairing_manifest.csv         which image was paired with which patient
+    ├── pairing_summary.json         mode and the plain-language disclosure
+    └── ablation_table.csv           image-only vs image+clinical vs image+genomic vs all
+```
+
+For a paper, the key files are `test_metrics.json`, `test_per_class.csv`, `test_confusion_matrix.png`, `leakage_audit.json` and `ablation_table.csv`.
+
+---
+
+## How the methodology works
+
+**Splitting.** Images are split with `StratifiedGroupKFold` on patient/slide ID so no group appears in more than one split. Without IDs the split is patch-level and flagged.
+
+**Leakage audit.** Perceptual hashes (dHash) find near-identical images across splits and report how many test images have a near-duplicate in training.
+
+**Metrics.** Accuracy, balanced accuracy and macro precision/recall/F1 all come from **one** confusion matrix with the averaging stated, and an assertion checks that weighted recall equals accuracy. 95% intervals come from bootstrap resampling. The original repository reported inconsistent figures from different sources.
+
+**Calibration.** Expected Calibration Error (ECE) is measured; a temperature is fitted on the validation split and kept **only if it improves validation ECE**.
+
+**Tabular preprocessing.** Imputation values, z-score statistics and the top-variance gene list are learned **inside each cross-validation fold** on training patients only, so no information leaks from held-out patients. Missing-value indicators are included.
+
+**Subtype models.** Random forests, evaluated with pooled out-of-fold predictions from stratified 5-fold CV. Classes with too few patients are excluded and reported.
+
+**Fusion.** A small network over image features plus clinical and genomic embeddings, trained with **modality dropout** and a presence mask, so missing inputs are handled by design. Pairing is patient-disjoint and written to a manifest. The disclosure of the pairing mode is attached to every output.
+
+**Explainability.** Grad-CAM from the last residual stage (forward hook plus gradient hook). SHAP TreeExplainer on the random forest. Both are presented as descriptions of model behaviour, not clinical evidence.
+
+**Serving.** The `Predictor` validates inputs, falls back across modalities, flags low confidence (below 60%), and never presents experimental fusion as the primary prediction unless pairing is `matched`.
+
+---
+
+## Configuration
+
+| Setting | Where | Default |
+|---|---|---|
+| Image size, seed, low-confidence threshold (0.60), minimum genomic coverage (0.50) | `gastricsentinel/config.py` | see file |
+| `RETENTION_HOURS` | environment | `24` (how long uploads and results are kept) |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, `CHAT_MODEL` | environment | unset (offline assistant) |
+| Upload limit | `app/app.py` | 25 MB |
+| Rate limits | `app/app.py` | 20 predictions / 40 chats per minute per IP |
+
+Uploads are stored in `app/static/outputs/`, named by random IDs, and purged by age. There are no accounts and no database.
+
+---
+
+## Tests
+
+```bash
+python -m pytest -q tests
+```
+
+The suite builds synthetic data, trains tiny models, and exercises the whole stack: split leakage, preprocessing, metric consistency, pairing disclosure, the predictor, the Flask routes (predict, result, model card, output-file validation, chat) and PDF generation (asserting a multi-page report). It takes about two minutes on CPU and needs no real data.
+
+---
 
 ## Docker
 
 ```bash
-docker build -t gastricsentinel . && docker run -p 5000:5000 -v $PWD/artifacts:/srv/artifacts gastricsentinel
+docker build -t gastricsentinel .
+docker run -p 5000:5000 -v "$PWD/artifacts:/srv/artifacts" gastricsentinel
 ```
 
-## Not carried over from the old repo
+The image runs gunicorn with **one worker** and several threads, because Grad-CAM hooks mutate the shared model. Scale by running more containers.
 
-Supabase patient database and patients/dashboard pages (coupled to a hard-coded schema and hard-coded model accuracy). The chatbot was kept and rebuilt (see above). A database can be re-added on top of `Predictor` and `/api/predict`.
+---
 
+## Troubleshooting
 
-## Web interface
+| Problem | Fix |
+|---|---|
+| `ModuleNotFoundError: No module named 'numpy'` / `pandas` | the virtual environment isn't active or packages weren't installed into it. Run `source .venv/bin/activate`, check `which python`, then `python -m pip install -r requirements.txt` |
+| `error: externally-managed-environment` | you're using the system pip. Create and activate a `.venv`, and use `python -m pip` |
+| App says "Models not loaded" | `artifacts/image/image_model.pt` is missing. Make sure training wrote to the same project folder you run the app from |
+| Image trainer exits asking for group IDs | pass `--group-regex`, or `--allow-patch-level-split` and accept the `leakage_risk` flag |
+| SSL error downloading ResNet-50 weights on macOS | run `/Applications/Python\ 3.*/Install\ Certificates.command` once, then retry |
+| MPS error mid-training | prefix with `PYTORCH_ENABLE_MPS_FALLBACK=1` |
+| `ERR_UNSAFE_PORT` in a browser | use the default port 5000; some ports are blocked by browsers |
+| Genomic file "ignored" | it covers under 50% of the model's genes; check gene symbols match the Xena HiSeqV2 naming |
+| Training accuracy far above validation | overfitting; add stronger augmentation or regularisation, and don't train longer |
 
-Run `python -m app.app` and open http://127.0.0.1:5000.
+---
 
-- Opening sequence (curtain reveal, once per browser session; "Skip" available).
-- Eight tabs: Overview, Analyze, Results, Explainability, Clinical & Genomic, Assistant, History, Methods. Results-dependent tabs unlock after an analysis.
-- Light and dark theme toggle (top right). Follows the system setting until you choose; the choice is remembered.
-- Animations respect `prefers-reduced-motion`.
-- Overview and Methods read the real validation record from `artifacts/` (`/api/model-card`); nothing on those tabs is hard-coded.
-- The PDF report (`/report/<id>`) is multi-page: findings, inputs, probability chart, Grad-CAM, SHAP, fusion status, per-class validation, confusion matrix, leakage audit, limitations, methods and a reviewer sign-off block.
+## What changed and why
 
-## Training on your own data layout
+The original repository could not be reproduced and its claims were not all supportable. The rebuild addresses each reviewer concern directly:
 
-```bash
-python -m gastricsentinel.train_image --data-dir data/images/HMU-GC-HE-30K --group-regex "<patient-id regex>" --out-dir artifacts/image
-python -m gastricsentinel.train_tabular --clinical-tsv data/clinical/extracted/clinical.tsv \
-  --expression data/genomics/TCGA.STAD.sampleMap_HiSeqV2_PANCAN \
-  --subtypes data/clinical/stad_tcga_pan_can_atlas_2018_clinical_data.tsv --out-dir artifacts/tabular
-python -m gastricsentinel.train_fusion --image-dir artifacts/image --clinical-tsv ... --expression ... --pairing random
-```
-If image filenames carry no patient ID, pass `--allow-patch-level-split`; the report is then flagged `leakage_risk`.
+| Concern | Rebuild |
+|---|---|
+| Image and genomic data were paired without a defined rule | explicit `random` / `matched` pairing, written to a manifest, disclosed in outputs |
+| Inconsistent accuracy and F1 figures | all metrics from one confusion matrix, averaging stated, consistency asserted |
+| Possible train/test leakage | group-aware splits, patch-level mode refused unless acknowledged and flagged, near-duplicate audit |
+| Gene selection and scaling over all patients before splitting | all statistics learned inside each training fold |
+| Fusion was not trained for missing modalities | modality dropout and a presence mask |
+| Risk score and explainability unvalidated | confidence is calibrated and measured; Grad-CAM and SHAP are labelled as model descriptions |
+| Overclaiming | disclaimers everywhere, limits listed in the UI and the PDF |
+
+The full list is in [`docs/AUDIT.md`](docs/AUDIT.md); the pre-submission list is in [`docs/CAMERA_READY_CHECKLIST.md`](docs/CAMERA_READY_CHECKLIST.md).
+
+---
+
+## Limitations
+
+- Research prototype; not validated for clinical use.
+- A result describes **one image patch**, not a slide and not a patient.
+- Trained on public data. Behaviour on other scanners, stains or hospitals is unknown.
+- Image datasets and TCGA-STAD are **different cohorts**. Unless slides are matched to TCGA barcodes, fusion is a control experiment and cannot show multimodal benefit.
+- A patch-level split can inflate scores. Report such results as such.
+- Rare molecular subtypes (for example POLE, EBV, MSI) have few patients and are estimated unreliably.
+- TCGA subtype labels were originally defined using molecular data that includes expression, so predicting them from expression is partly circular.
+- Grad-CAM and SHAP describe the model, not biology, and have not been validated by pathologists.
+
+---
+
+## Reporting results honestly
+
+If you publish numbers from this system:
+
+1. State the split mode. If it was patch-level, say so and quote the near-duplicate count from `leakage_audit.json`.
+2. Report the confidence intervals, not just point estimates.
+3. Describe fusion as a control unless you used `matched` pairing with real patient correspondence.
+4. Do not claim that clinical or genomic data improved image classification from a `random`-pairing ablation.
+5. Prefer an external test set (a different dataset, scanner or hospital) over any internal split.
+
+---
+
+## Acknowledgements and data licences
+
+Datasets are the property of their creators and are used under their own licences: HMU-GC-HE-30K, GasHisSDB, and TCGA-STAD (via the GDC, UCSC Xena and cBioPortal). Check each licence before redistributing data or trained models.

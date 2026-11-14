@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<script>(function(){try{var t=localStorage.getItem('gs-theme');if(!t)t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=t}catch(e){document.documentElement.dataset.theme='light'}})()</script>
+<title>GastricSentinel</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+
+<!-- ============ opening sequence ============ -->
+<div id="splash" class="splash" role="presentation">
+  <div class="sp-panel top"></div><div class="sp-panel bot"></div>
+  <div class="sp-body">
+    <svg class="sp-mark" viewBox="0 0 120 120" aria-hidden="true">
+      <circle class="d1" cx="60" cy="60" r="46"/>
+      <circle class="d2" cx="60" cy="60" r="30"/>
+      <path class="d3" d="M60 8v20M60 92v20M8 60h20M92 60h20"/>
+      <circle class="d4" cx="60" cy="60" r="7"/>
+    </svg>
+    <div class="sp-title" id="spTitle" aria-label="GastricSentinel"></div>
+    <div class="sp-sub">Multimodal histopathology analysis</div>
+    <div class="sp-bar"><i></i></div>
+    <div class="sp-status" id="spStatus">Initialising</div>
+    <button class="sp-skip" id="spSkip" type="button">Skip</button>
+  </div>
+</div>
+
+<canvas id="bg" aria-hidden="true"></canvas>
+<div class="reticle" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="bar-in">
+    <a class="brand" href="#/overview" aria-label="GastricSentinel home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="12" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="16" r="5.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 1v6M16 25v6M1 16h6M25 16h6" stroke="currentColor" stroke-width="2"/></svg>
+      <span>GastricSentinel</span>
+    </a>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="Sections">
+      <button role="tab" data-tab="overview">Overview</button>
+      <button role="tab" data-tab="analyze">Analyze</button>
+      <button role="tab" data-tab="results" data-needs="result">Results</button>
+      <button role="tab" data-tab="explain" data-needs="result">Explainability</button>
+      <button role="tab" data-tab="clinical" data-needs="result">Clinical &amp; Genomic</button>
+      <button role="tab" data-tab="assistant">Assistant</button>
+      <button role="tab" data-tab="history">History</button>
+      <button role="tab" data-tab="methods">Methods</button>
+      <span class="tab-ind" id="tabInd" aria-hidden="true"></span>
+    </nav>
+    <button class="theme" id="themeBtn" type="button" aria-label="Toggle light and dark theme" title="Toggle theme">
+      <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+    </button>
+    <div class="status" title="Model status"><span class="dot" id="statusDot"></span><span id="statusTxt">Checking&hellip;</span></div>
+  </div>
+  <div class="progress" id="progress"></div>
+</header>
+
+<main id="main">
+
+  <!-- ================= OVERVIEW ================= -->
+  <section class="view" id="v-overview" data-title="Overview">
+    <div class="hero-grid">
+      <div class="hero">
+        <p class="kicker">Gastric histopathology &middot; research prototype</p>
+        <h1><span class="ln" style="--l:0"><span>Read the tissue.</span></span><span class="ln" style="--l:1"><span>See the <em class="hl" style="font-style:normal">evidence<svg viewBox="0 0 200 12" preserveAspectRatio="none" aria-hidden="true"><path d="M2 8 C 40 1, 80 12, 120 5 S 180 3, 198 7"/></svg></em>.</span></span></h1>
+        <p class="lede">Upload an H&amp;E patch. GastricSentinel classifies the tissue, shows where the model looked, adds clinical and genomic context, and writes a documented report that states its own limits.</p>
+        <div class="actions"><a class="btn primary" href="#/analyze">Start an analysis</a><a class="btn ghost" href="#/methods">How it was validated</a></div>
+        <div class="proof"><span><i></i>Patient-level splits</span><span><i></i>Calibrated confidence</span><span><i></i>Grad-CAM &amp; SHAP</span></div>
+      </div>
+      <div class="specimen" id="specimen" aria-hidden="true">
+        <div class="spec-ring"></div><div class="spec-ring b"></div>
+        <div class="spec-disc"><div class="spec-cells" id="specCells"></div><div class="sweep"></div><div class="roi"></div></div>
+        <div class="chip c1"><div class="ico" data-icon="scan"></div><div>Classify<small>ResNet-50</small></div></div>
+        <div class="chip c2"><div class="ico" data-icon="eye"></div><div>Grad-CAM<small>where it looked</small></div></div>
+        <div class="chip c3"><div class="ico" data-icon="doc"></div><div>PDF report<small>with limits</small></div></div>
+      </div>
+    </div>
+    <div class="marquee" id="marquee" aria-label="Tissue classes"><div class="track" id="marqTrack"></div></div>
+
+    <div class="stats stagger" id="statStrip" aria-label="Validation summary"></div>
+
+    <div class="grid3 stagger">
+      <article class="card feat"><div class="ico" data-icon="scan"></div><h3>Classify</h3><p>ResNet-50 tissue classification with calibrated confidence and an explicit low-confidence flag.</p></article>
+      <article class="card feat"><div class="ico" data-icon="eye"></div><h3>Explain</h3><p>Grad-CAM shows where the network looked. SHAP shows which clinical or genomic inputs moved the subtype estimate.</p></article>
+      <article class="card feat"><div class="ico" data-icon="doc"></div><h3>Document</h3><p>A multi-page PDF with inputs, charts, validation figures, limitations and a reviewer sign-off block.</p></article>
+    </div>
+
+    <div class="card stagger">
+      <h2>How an analysis flows</h2>
+      <ol class="timeline" id="timeline">
+        <li><b>Upload</b><span>One image patch. Age, sex, stage and a gene-expression file are optional.</span></li>
+        <li><b>Classify</b><span>Image features and class probabilities, calibrated on a validation split.</span></li>
+        <li><b>Explain</b><span>Grad-CAM for the image; SHAP for clinical and genomic features.</span></li>
+        <li><b>Report</b><span>Every modality used or skipped is stated. Download the PDF.</span></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ================= ANALYZE ================= -->
+  <section class="view" id="v-analyze" data-title="Analyze">
+    <header class="vhead stagger"><h2>New analysis</h2><p>Only the image is required. Missing inputs are handled by design and reported in the results.</p></header>
+    <form id="f" class="grid2 stagger" enctype="multipart/form-data">
+      <div class="card">
+        <h3>1. Image</h3>
+        <div class="drop" id="drop">
+          <input type="file" id="image" name="image" accept="image/*" aria-label="Histopathology image">
+          <div class="hint"><div class="ico big" data-icon="upload"></div><b>Drop an image here</b><span>or click to browse &middot; PNG, JPEG, TIFF</span></div>
+          <img id="prev" alt="Selected image preview">
+          <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+          <div class="laser"></div>
+        </div>
+        <ol class="steps" id="steps" aria-hidden="true"></ol>
+      </div>
+      <div class="card">
+        <h3>2. Clinical context <small>optional</small></h3>
+        <div class="row3">
+          <div class="field"><label for="age">Age</label><input id="age" name="age" type="number" min="0" max="120" placeholder="years"></div>
+          <div class="field"><label for="sex">Sex</label><select id="sex" name="sex"><option value="">Not stated</option><option>female</option><option>male</option></select></div>
+          <div class="field"><label for="stage">Stage</label><select id="stage" name="stage"><option value="">Not stated</option><option>I</option><option>II</option><option>III</option><option>IV</option></select></div>
+        </div>
+        <h3 class="mt">3. Gene expression <small>optional</small></h3>
+        <div class="field"><label for="genomic_csv">CSV or TSV with two columns: gene, value</label><input class="plain" type="file" id="genomic_csv" name="genomic_csv" accept=".csv,.tsv,.txt"></div>
+        <p class="note">Used only if it covers at least half of the model's genes; otherwise it is ignored and you are told.</p>
+        <button id="go" class="btn primary wide" type="submit"><span>Run analysis</span></button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ================= RESULTS ================= -->
+  <section class="view" id="v-results" data-title="Results"><div id="resBody"></div></section>
+
+  <!-- ================= EXPLAINABILITY ================= -->
+  <section class="view" id="v-explain" data-title="Explainability"><div id="expBody"></div></section>
+
+  <!-- ================= CLINICAL & GENOMIC ================= -->
+  <section class="view" id="v-clinical" data-title="Clinical and genomic"><div id="cliBody"></div></section>
+
+  <!-- ================= ASSISTANT ================= -->
+  <section class="view" id="v-assistant" data-title="Assistant">
+    <header class="vhead stagger"><h2>Assistant</h2><p>Ask what any part of the result means. It explains; it does not diagnose or advise on treatment.</p></header>
+    <div class="chatbox card stagger">
+      <div id="msgs" class="msgs" aria-live="polite"></div>
+      <div id="sugg" class="sugg"></div>
+      <form id="chatForm" autocomplete="off"><input id="chatIn" maxlength="1000" placeholder="Ask about your result&hellip;" aria-label="Message"><button class="btn primary" type="submit">Send</button></form>
+      <p class="note" id="chatNote">Built-in assistant. Set an API key on the server for a language-model assistant.</p>
+    </div>
+  </section>
+
+  <!-- ================= HISTORY ================= -->
+  <section class="view" id="v-history" data-title="History">
+    <header class="vhead stagger"><h2>History</h2><p>Analyses from this browser. Server copies are deleted after the retention period.</p></header>
+    <div id="histBody" class="stagger"></div>
+  </section>
+
+  <!-- ================= METHODS ================= -->
+  <section class="view" id="v-methods" data-title="Methods">
+    <header class="vhead stagger"><h2>Methods, validation and limits</h2><p>What the deployed models were evaluated on, and what that cannot show.</p></header>
+    <div class="card stagger">
+      <h3>Pipeline</h3>
+      <svg class="flow" viewBox="0 0 900 150" role="img" aria-label="Pipeline: image to ResNet-50 to calibration to prediction; clinical and genomic to subtype model to SHAP">
+        <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#1457a6"/></marker></defs>
+        <g class="nodes">
+          <rect x="10" y="15" width="130" height="44" rx="8"/><text x="75" y="42">Image patch</text>
+          <rect x="190" y="15" width="150" height="44" rx="8"/><text x="265" y="42">ResNet-50</text>
+          <rect x="390" y="15" width="150" height="44" rx="8"/><text x="465" y="42">Calibration</text>
+          <rect x="590" y="15" width="150" height="44" rx="8"/><text x="665" y="42">Tissue class</text>
+          <rect x="760" y="15" width="130" height="44" rx="8"/><text x="825" y="42">Grad-CAM</text>
+          <rect x="10" y="90" width="130" height="44" rx="8"/><text x="75" y="117">Clinical + genes</text>
+          <rect x="190" y="90" width="150" height="44" rx="8"/><text x="265" y="117">Subtype model</text>
+          <rect x="390" y="90" width="150" height="44" rx="8"/><text x="465" y="117">SHAP</text>
+          <rect x="590" y="90" width="150" height="44" rx="8"/><text x="665" y="117">Fusion (exp.)</text>
+        </g>
+        <g class="links" marker-end="url(#ar)"><path d="M140 37H188"/><path d="M340 37H388"/><path d="M540 37H588"/><path d="M740 37H758"/><path d="M140 112H188"/><path d="M340 112H388"/><path d="M540 112H588"/></g>
+      </svg>
+    </div>
+    <div id="methodsCard" class="stagger"></div>
+    <div class="card stagger">
+      <h3>Limitations</h3>
+      <ul class="plain-list">
+        <li>Research prototype; not validated for clinical use and not a medical device.</li>
+        <li>Results describe one image patch, not a whole slide or a patient.</li>
+        <li>Public training data; performance on other scanners, stains or hospitals is unknown.</li>
+        <li>Image datasets and TCGA-STAD come from different cohorts. Unless slides are matched to TCGA barcodes, fusion is a control experiment and cannot show multimodal benefit.</li>
+        <li>Grad-CAM and SHAP describe model behaviour; they have not been validated by pathologists.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<footer class="foot"><div class="bar-in"><span class="banner">Research prototype. Not clinically validated. Not for diagnosis or treatment decisions. A pathologist must review every result.</span></div></footer>
+<div id="toast" class="toast" role="alert"></div>
+
+<script src="{{ url_for('static', filename='js/bg.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+<script src="{{ url_for('static', filename='js/fx.js') }}"></script>
+</body>
+</html>

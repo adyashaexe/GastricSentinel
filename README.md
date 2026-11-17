@@ -65,7 +65,7 @@ python -m pytest -q tests          # end-to-end test, ~2 minutes
 **Run it on real data:** see [Data you need](#data-you-need) and [Training](#training), then:
 
 ```bash
-python -m app.app                  # http://127.0.0.1:5000
+uvicorn app.app:app --reload       # http://127.0.0.1:8000
 ```
 
 ---
@@ -74,8 +74,8 @@ python -m app.app                  # http://127.0.0.1:5000
 
 ```
 GastricSentinel/
-├── app/                        Flask web app
-│   ├── app.py                  routes, rate limiting, upload retention
+├── app/                        FastAPI web app (async)
+│   ├── app.py                  routes, rate limiting, startup model loading
 │   ├── templates/index.html    single-page UI
 │   └── static/
 │       ├── css/app.css         themed, responsive styles
@@ -158,7 +158,7 @@ A leakage-safe image split needs a **group ID** (patient or slide) for every ima
 
 Run from the project root with the virtual environment active. Three steps; each writes to its own folder under `artifacts/`.
 
-### 1. Image model (ResNet-50)
+### 1. Image model (six backbones)
 
 ```bash
 python -m gastricsentinel.train_image \
@@ -175,13 +175,32 @@ Useful flags:
 
 | Flag | Meaning |
 |---|---|
+| `--backbone` | `resnet18`, `resnet50` (default), `densenet121`, `efficientnet_b0`, `convnext_tiny`, `mobilenet_v3_large` |
 | `--trainable {fc,layer4,all}` | how much of the network is fine-tuned (default `layer4`) |
+| `--aug {strong,light}` | stain/geometry augmentation strength |
+| `--label-smoothing`, `--mixup`, `--grad-clip` | regularisation options |
+| `--warmup-epochs`, `--head-lr-mult` | warm-up + cosine schedule; higher LR for the new head |
+| `--tta` | flip test-time augmentation at evaluation |
+| `--ood-samples N` | training embeddings used to fit the out-of-distribution detector |
+| `--note "text"` | label stored with the saved model version |
 | `--class-weights` | weight the loss for class imbalance |
 | `--max-per-class N` | cap images per class, for a fast trial run |
 | `--epochs`, `--patience` | training length and early-stopping patience |
 | `--lr`, `--weight-decay` | optimiser settings |
 | `--manifest file.csv` | explicit `path,label,group` table instead of folders |
 | `--no-pretrained` | skip ImageNet weights (offline or smoke tests) |
+
+Each run also produces: temperature scaling (kept only if it lowers validation calibration error), a reliability diagram and Brier score, an out-of-distribution detector (`ood_stats.npz`), and a registered model version under `artifacts/versions/<id>/`.
+
+Version and compare commands:
+
+```bash
+python -m gastricsentinel.registry list
+python -m gastricsentinel.registry activate <version>
+python -m gastricsentinel.compare_models <versionA> <versionB>   # exact McNemar + paired bootstrap CIs
+```
+
+Models trained before this release still load. Retrain to get the out-of-distribution check, reliability diagram and versions.
 
 A quick trial (about 10–15 minutes on an Apple-silicon Mac):
 
@@ -225,34 +244,37 @@ The step writes an ablation table comparing image-only, image+clinical, image+ge
 ## Running the web app
 
 ```bash
-python -m app.app
+uvicorn app.app:app --reload
 ```
 
-Open **http://127.0.0.1:5000**. The app needs at least `artifacts/image/image_model.pt`. Without it, the page loads but shows "Models not loaded". Subtype and fusion features switch on automatically when their artifacts exist.
+Open **http://127.0.0.1:8000**. The app needs at least `artifacts/image/image_model.pt`. Without it, the page loads but shows "Models not loaded". Subtype and fusion features switch on automatically when their artifacts exist.
 
-For anything beyond local use, run it behind gunicorn (see [Docker](#docker)). The built-in server is for development.
+Drop `--reload` for anything beyond development. Interactive API docs are at **/docs**.
 
 ---
 
 ## Using the interface
 
-One scrolling page, responsive from phone to widescreen, with a light/dark toggle in the header.
+A sidebar app with a light/dark toggle; on phones the sidebar becomes a drawer. A short guided tour runs on first visit and can be replayed ("Take the tour").
 
 | Section | What it does |
 |---|---|
-| **Hero** | live microscope visual; real validation numbers pulled from your trained models |
-| **Try it** | drop an image; optionally add age, sex, stage and a gene-expression file; run the analysis |
-| **Your result** | appears after you run an analysis: plain-language summary, confidence gauge, class probabilities, Grad-CAM before/after slider, subtype estimate and SHAP, fusion result, the inputs that were used, PDF download |
-| **How it works** | the pipeline, as a diagram |
-| **Evidence** | held-out metrics, per-class table, leakage audit, subtype and fusion validation, and the limitations |
-| **Assistant** | floating button, bottom-right (full-width sheet on phones) |
+| **Analyze image** | upload a patch (optionally age, sex, stage, gene file). Result page: zoom/pan viewer with Grad-CAM overlay, split and opacity controls, confidence, class probabilities, input check (out-of-distribution warning), subtype, expert review, PDF/CSV/JSON export |
+| **Batch** | up to 25 images at once, with a summary table and export |
+| **Whole slide** | a large image (up to 200 MB) is tiled, classified, and shown as a tile map with top-scoring tiles. Export proprietary formats (.svs, .ndpi) to PNG/TIFF first |
+| **Compare** | two analyses side by side with linked zoom |
+| **Library & reports** | every saved analysis, searchable, with reports and export |
+| **Review queue** | reviewer accounts only |
+| **Model performance** | overview, interactive confusion matrix, reliability diagram, training curves, versions and statistical comparison |
+| **About & limits** | scope and limitations |
+| **Assistant** | floating button, bottom-right |
 
 Details worth knowing:
 
 - Only the image is required. Anything left out is skipped and **named as skipped** in the results and the PDF.
-- A gene-expression file is two columns, `gene,value` (CSV or TSV, header optional). It is used only if it covers at least half of the model's genes; otherwise it is ignored and you are told.
-- Recent analyses from this browser appear under the form for quick re-opening. Server copies are deleted after the retention period (default 24 hours), and expired entries remove themselves from the list.
-- The theme follows your system setting until you choose one; the choice is remembered. Animations respect the system "reduce motion" setting.
+- A gene-expression file is two columns, `gene,value`. It is used only if it covers at least half of the model's genes.
+- Everything is saved in the database and kept; nothing is deleted automatically.
+- Zoom: wheel or pinch, drag to pan, double-click to zoom, arrow keys when focused.
 
 ### PDF report
 
@@ -276,6 +298,11 @@ Details worth knowing:
 | GET | `/api/status` | which models are loaded |
 | POST | `/api/predict` | multipart: `image` (required), `age`, `sex`, `stage`, `genomic_csv` |
 | GET | `/api/result/<id>` | a stored result (ID is validated; 404 if expired) |
+| POST | `/api/batch` | multipart `images` (up to 25) |
+| POST | `/api/slide` | multipart `image`, optional `tile` |
+| GET | `/api/analyses` | saved analyses for the signed-in user |
+| GET | `/api/export?ids=a,b&format=csv\|json` | export analyses |
+| POST | `/api/analyses/<id>/review` | expert review (signed in) |
 | GET | `/api/model-card` | validation facts read from the artifacts |
 | POST | `/api/chat` | assistant; body `{message, result_id, history}` |
 | GET | `/report/<id>` | PDF report |
@@ -293,7 +320,7 @@ A small chat window in the bottom-right corner. It explains the loaded result (c
 ```bash
 export ANTHROPIC_API_KEY=...     # or OPENAI_API_KEY=...
 export CHAT_MODEL=...            # optional override
-python -m app.app
+uvicorn app.app:app --reload
 ```
 
 If the model call fails for any reason, it falls back to offline mode automatically. The page shows which mode answered.
@@ -360,12 +387,45 @@ For a paper, the key files are `test_metrics.json`, `test_per_class.csv`, `test_
 | Setting | Where | Default |
 |---|---|---|
 | Image size, seed, low-confidence threshold (0.60), minimum genomic coverage (0.50) | `gastricsentinel/config.py` | see file |
-| `RETENTION_HOURS` | environment | `24` (how long uploads and results are kept) |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, `CHAT_MODEL` | environment | unset (offline assistant) |
+| `GS_DB` | environment | `instance/gastricsentinel.db` (or `<outputs>/gastricsentinel.db` when an output dir is passed to `create_app`) |
+| `GS_SECRET_KEY` | environment | generated once and saved as `secret.key` next to the database |
+| `GS_REVIEWER_EMAILS`, `GS_ADMIN_EMAILS` | environment | empty (comma-separated emails) |
+| `GS_REQUIRE_LOGIN` | environment | off (set `1` to require sign-in to analyse) |
+| `GS_HTTPS` | environment | off (set `1` behind HTTPS so the session cookie is `Secure`) |
 | Upload limit | `app/app.py` | 25 MB |
 | Rate limits | `app/app.py` | 20 predictions / 40 chats per minute per IP |
 
-Uploads are stored in `app/static/outputs/`, named by random IDs, and purged by age. There are no accounts and no database.
+Uploads are stored in `app/static/outputs/`, named by random IDs. Every analysis and chat message is stored in SQLite and kept until its owner (or an admin) deletes the analysis. See [Database and accounts](#database-and-accounts).
+
+## Database and accounts
+
+GastricSentinel uses **SQLite** through SQLModel (`app/database.py` for the engine and queries, `app/models.py` for the tables `users`, `prediction_results`, `chat_logs`, `analysis_reviews`). It is one local file in WAL mode, so reads and writes can overlap, and there is no server to install. A database from the earlier Flask version is migrated automatically on first start. Accounts are optional: without signing in, everything works and results are temporary.
+
+| Table | Holds |
+|---|---|
+| `users` | email, name, salted PBKDF2-SHA256 password hash |
+| `prediction_results` | prediction, confidence, tumour probability, mode, model version, full result JSON, owner (or none) |
+| `chat_logs` | every assistant message, linked to the analysis and account when there are any |
+| `analysis_reviews` | reviewer verdict (agree / disagree / unsure), suggested class, note; one per reviewer per analysis |
+
+**What each part does**
+- **Analysis history.** Signed in, every analysis is saved to your account, listed under "Your saved analyses", and can be reopened or deleted. Each stamps the model version (first 10 hex chars of the SHA-256 of `image_model.pt`).
+- **Chat logs.** The assistant conversation is stored with the analysis and restored when you reopen it. Anonymous chats are stored too, without an account attached.
+- **Reviewer sign-off.** Reviewers see a queue of saved analyses, open one, and record a verdict. Roles come only from the environment, so nobody can promote themselves:
+
+```bash
+export GS_REVIEWER_EMAILS="dr.one@hospital.org,dr.two@hospital.org"
+export GS_ADMIN_EMAILS="you@kiit.ac.in"
+export GS_SECRET_KEY="$(python -c 'import secrets;print(secrets.token_hex(32))')"
+uvicorn app.app:app --reload
+```
+
+**Privacy rules.** An analysis owned by an account is visible only to its owner and to reviewers/admins; anyone else gets a 404. Anonymous analyses are reachable only through their unguessable 32-character ID and are stored indefinitely, as are anonymous chat messages (they are not tied to any account). Passwords are never stored in plain text, sign-in is rate-limited, cross-site POSTs are refused, and API responses are not cached.
+
+**Endpoints:** `POST /api/auth/register|login|logout`, `GET /api/auth/me`, `GET /api/analyses`, `DELETE /api/analyses/<id>`, `GET /api/analyses/<id>/chat`, `POST /api/analyses/<id>/review`, `GET /api/review/queue?status=pending|reviewed|all`.
+
+**Backup and reset.** Copy the `.db` file (and `secret.key`) to back up; delete them to start clean. Do not commit them; `instance/` and `*.db` are in `.gitignore`.
 
 ---
 
@@ -375,7 +435,7 @@ Uploads are stored in `app/static/outputs/`, named by random IDs, and purged by 
 python -m pytest -q tests
 ```
 
-The suite builds synthetic data, trains tiny models, and exercises the whole stack: split leakage, preprocessing, metric consistency, pairing disclosure, the predictor, the Flask routes (predict, result, model card, output-file validation, chat) and PDF generation (asserting a multi-page report). It takes about two minutes on CPU and needs no real data.
+The suite builds synthetic data, trains tiny models, and exercises the whole stack: split leakage, preprocessing, metric consistency, pairing disclosure, the predictor, the FastAPI routes (predict, result, model card, output-file validation, chat) and PDF generation (asserting a multi-page report). It takes about two minutes on CPU and needs no real data.
 
 ---
 
@@ -383,10 +443,10 @@ The suite builds synthetic data, trains tiny models, and exercises the whole sta
 
 ```bash
 docker build -t gastricsentinel .
-docker run -p 5000:5000 -v "$PWD/artifacts:/srv/artifacts" gastricsentinel
+docker run -p 8000:8000 -v "$PWD/artifacts:/srv/artifacts" gastricsentinel
 ```
 
-The image runs gunicorn with **one worker** and several threads, because Grad-CAM hooks mutate the shared model. Scale by running more containers.
+The image runs uvicorn with **one process**: the model is loaded once at startup and Grad-CAM runs under an asyncio lock, because its hooks mutate the shared model. Scale by running more containers.
 
 ---
 
@@ -400,7 +460,7 @@ The image runs gunicorn with **one worker** and several threads, because Grad-CA
 | Image trainer exits asking for group IDs | pass `--group-regex`, or `--allow-patch-level-split` and accept the `leakage_risk` flag |
 | SSL error downloading ResNet-50 weights on macOS | run `/Applications/Python\ 3.*/Install\ Certificates.command` once, then retry |
 | MPS error mid-training | prefix with `PYTORCH_ENABLE_MPS_FALLBACK=1` |
-| `ERR_UNSAFE_PORT` in a browser | use the default port 5000; some ports are blocked by browsers |
+| `ERR_UNSAFE_PORT` in a browser | use the default port 8000; some ports are blocked by browsers |
 | Genomic file "ignored" | it covers under 50% of the model's genes; check gene symbols match the Xena HiSeqV2 naming |
 | Training accuracy far above validation | overfitting; add stronger augmentation or regularisation, and don't train longer |
 

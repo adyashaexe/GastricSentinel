@@ -36,6 +36,19 @@ def ece(probs, y_true, n_bins: int = 15) -> float:
     return float(total)
 
 
+def reliability(probs, y_true, n_bins: int = 10) -> list[dict]:
+    """Per-bin top-label confidence vs accuracy (for a reliability diagram)."""
+    probs, y_true = np.asarray(probs), np.asarray(y_true)
+    conf, ok = probs.max(1), probs.argmax(1) == y_true
+    edges, rows = np.linspace(0, 1, n_bins + 1), []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi) if lo > 0 else (conf >= lo) & (conf <= hi)
+        rows.append({"lo": float(lo), "hi": float(hi), "n": int(m.sum()),
+                     "confidence": float(conf[m].mean()) if m.any() else None,
+                     "accuracy": float(ok[m].mean()) if m.any() else None})
+    return rows
+
+
 def evaluate(y_true, y_pred, class_names, y_prob=None, n_boot: int = 1000, seed: int = 0) -> dict:
     y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
     labels = list(range(len(class_names)))
@@ -71,6 +84,9 @@ def evaluate(y_true, y_pred, class_names, y_prob=None, n_boot: int = 1000, seed:
     }
     if y_prob is not None:
         out["ece"] = ece(y_prob, y_true)
+        out["reliability"] = reliability(y_prob, y_true)
+        onehot = np.eye(len(class_names))[y_true]
+        out["brier"] = float(np.mean(np.sum((np.asarray(y_prob) - onehot) ** 2, 1)))
         try:
             present = [i for i in labels if (y_true == i).any()]
             y_prob = np.asarray(y_prob)
@@ -129,8 +145,21 @@ def save_report(metrics: dict, out_dir, prefix: str, extra: dict | None = None) 
         fig.tight_layout()
         fig.savefig(out_dir / f"{prefix}_confusion_matrix.png", dpi=150)
         plt.close(fig)
+        if m.get("reliability"):
+            rel = [r for r in m["reliability"] if r["n"]]
+            fig, ax = plt.subplots(figsize=(4, 4))
+            ax.plot([0, 1], [0, 1], "--", color="#999", lw=1)
+            ax.plot([r["confidence"] for r in rel], [r["accuracy"] for r in rel], "o-", color="#1457a6")
+            ax.set_xlabel("Confidence")
+            ax.set_ylabel("Accuracy")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_title(f"Reliability (ECE {m.get('ece', 0):.3f})", fontsize=10)
+            fig.tight_layout()
+            fig.savefig(out_dir / f"{prefix}_reliability.png", dpi=150)
+            plt.close(fig)
     except Exception as e:  # plotting must never break a training run
-        print(f"(confusion-matrix plot skipped: {e})")
+        print(f"(plots skipped: {e})")
 
     ctx = m.get("context", {})
     lines = [

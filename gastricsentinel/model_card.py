@@ -27,7 +27,19 @@ def load_model_card(artifact_dir) -> dict:
             "temperature": _f(ctx.get("temperature")), "ece_before": _f(ctx.get("ece_before")),
             "ece_after": _f(ctx.get("ece_after")), "pretrained": ctx.get("pretrained"),
             "per_class": m["per_class"], "classes": m["class_names"],
+            "confusion_matrix": m.get("confusion_matrix"), "reliability": m.get("reliability"), "brier": _f(m.get("brier")),
+            "roc_auc": _f(m.get("roc_auc_macro_ovr")), "arch": ctx.get("arch") or "resnet50", "tta": ctx.get("tta"),
+            "epochs_run": ctx.get("epochs_run"), "aug": ctx.get("aug"),
         }
+        hp = d / "image" / "history.csv"
+        if hp.exists():
+            import pandas as pd
+            card["history"] = pd.read_csv(hp).round(4).to_dict("records")
+        op = d / "image" / "ood_stats.npz"
+        if op.exists():
+            from .ood import load_stats
+            o = load_stats(op)
+            card["ood"] = {"method": "mahalanobis", "threshold": o["threshold"], "id_median": o["id_p50"], "id_p95": o["id_p95"]}
     si = d / "image" / "split_info.json"
     if si.exists():
         s = load_json(si)
@@ -45,6 +57,10 @@ def load_model_card(artifact_dir) -> dict:
         card["tabular"] = {"protocol": m.get("context", {}).get("protocol"), "n_patients": m["n"],
                            "accuracy": _f(m["accuracy"]), "macro_f1": _f(m["macro"]["f1"]),
                            "classes": m["class_names"], "excluded_classes": ti.get("excluded_classes")}
+    from .registry import list_versions
+    card["versions"] = list_versions(d)
+    cdir = d / "comparisons"
+    card["comparisons"] = [load_json(f) for f in sorted(cdir.glob("*.json"))] if cdir.exists() else []
     fp = d / "fusion" / "pairing_summary.json"
     if fp.exists():
         f = load_json(fp)
@@ -55,4 +71,9 @@ def load_model_card(artifact_dir) -> dict:
 
 def confusion_png(artifact_dir):
     p = Path(artifact_dir) / "image" / "test_confusion_matrix.png"
+    return p if p.exists() else None
+
+
+def reliability_png(artifact_dir):
+    p = Path(artifact_dir) / "image" / "test_reliability.png"
     return p if p.exists() else None

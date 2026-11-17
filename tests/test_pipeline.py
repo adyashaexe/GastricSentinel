@@ -107,6 +107,26 @@ def test_end_to_end(synth, tmp_path):
               "test_per_class.csv", "test_confusion_matrix.csv", "test_confusion_matrix.png"):
         assert (art / "image" / f).exists(), f
     assert json.loads((art / "image" / "split_info.json").read_text())["leakage_risk"] is False
+    for f in ("ood_stats.npz", "test_reliability.png"):
+        assert (art / "image" / f).exists(), f
+    mt = json.loads((art / "image" / "test_metrics.json").read_text())
+    assert len(mt["reliability"]) == 10 and mt["brier"] >= 0 and mt["context"]["arch"] == "resnet50"
+    versions = list((art / "versions").glob("*/meta.json"))
+    assert len(versions) == 1
+
+    # a second backbone, then the statistical comparison between the two
+    _run("gastricsentinel.train_image", "--data-dir", str(synth / "images"), "--group-regex", r"^(P\d+)_",
+         "--out-dir", str(art / "image_b"), "--epochs", "2", "--batch-size", "32", "--image-size", "64",
+         "--no-pretrained", "--trainable", "all", "--backbone", "mobilenet_v3_large", "--mixup", "0.2", "--tta",
+         "--aug", "light")
+    assert json.loads((art / "image_b" / "test_metrics.json").read_text())["context"]["arch"] == "mobilenet_v3_large"
+    ids = sorted(v.parent.name for v in (art / "versions").glob("*/meta.json"))
+    assert len(ids) == 2
+    _run("gastricsentinel.compare_models", ids[0], ids[1], "--artifacts", str(art), "--n-boot", "200")
+    cmp_ = json.loads(next((art / "comparisons").glob("*.json")).read_text())
+    assert 0 <= cmp_["mcnemar"]["p_value"] <= 1 and cmp_["n_paired"] > 10 and len(cmp_["diff_b_minus_a"]["accuracy_ci95"]) == 2
+    from gastricsentinel.registry import list_versions
+    assert len(list_versions(art)) == 2
 
     _run("gastricsentinel.train_tabular", "--clinical-tsv", str(clin), "--expression", str(expr),
          "--subtypes", str(sub), "--out-dir", str(art / "tabular"), "--top-genes", "40", "--trees", "60")
@@ -154,38 +174,75 @@ def test_end_to_end(synth, tmp_path):
     assert cam.size[0] > 0
 
     # ---- web app + PDF
+    from fastapi.testclient import TestClient
+
     from app.app import create_app
     app = create_app(art, tmp_path / "out")
-    c = app.test_client()
-    assert c.get("/api/status").get_json()["ready"] is True
+    with TestClient(app) as c:
+        _web_checks(c, img, genes)
+
+
+def _web_checks(c, img, genes):
+    assert c.get("/api/status").json()["ready"] is True
     assert c.get("/").status_code == 200
     csv = "gene,value\n" + "\n".join(f"{g},8.0" for g in genes)
-    resp = c.post("/api/predict", data={
-        "image": (io.BytesIO(img.read_bytes()), "x.png"), "age": "55", "sex": "female", "stage": "II",
-        "genomic_csv": (io.BytesIO(csv.encode()), "g.csv")}, content_type="multipart/form-data")
-    assert resp.status_code == 200, resp.get_data(as_text=True)
-    j = resp.get_json()
+    resp = c.post("/api/predict", data={"age": "55", "sex": "female", "stage": "II"},
+                  files={"image": ("x.png", img.read_bytes()), "genomic_csv": ("g.csv", csv.encode())})
+    assert resp.status_code == 200, resp.text
+    j = resp.json()
     assert j["molecular_subtype"]["model"] == "genomic_clinical"
     rep = c.get(f"/report/{j['id']}")
-    assert rep.status_code == 200 and rep.data[:4] == b"%PDF"
-    assert rep.data.count(b"/Type /Page\n") + rep.data.count(b"/Type /Page ") >= 4, "report should be multi-page"
+    assert rep.status_code == 200 and rep.content[:4] == b"%PDF"
+    assert rep.content.count(b"/Type /Page\n") + rep.content.count(b"/Type /Page ") >= 4, "report should be multi-page"
     assert j["inputs"]["age"] == 55 and j["inputs"]["genomic_provided"] is True
     # new routes
     rid = j["id"]
-    assert c.get(f"/api/result/{rid}").get_json()["id"] == rid
+    assert c.get(f"/api/result/{rid}").json()["id"] == rid
     assert c.get("/api/result/" + "0" * 32).status_code == 404
-    mc = c.get("/api/model-card").get_json()
+    mc = c.get("/api/model-card").json()
     assert mc["available"] and mc["image"]["n_test"] > 0 and mc["fusion"]["pairing_mode"]
     assert c.get(f"/outputs/{rid}_gradcam.png").status_code == 200
     assert c.get(f"/outputs/{rid}.json").status_code == 404
     assert c.get("/outputs/..%2Fsecret.png").status_code == 404
     assert c.get("/report/../../etc/passwd").status_code == 404
     assert c.get("/report/" + "0" * 32).status_code == 404
+    assert "ood" in j and "flags" in j["ood"] and j["model_info"]["arch"] == "resnet50"
+    mc2 = c.get("/api/model-card").json()
+    assert mc2["image"]["confusion_matrix"] and mc2["image"]["reliability"] and mc2["history"] and mc2["ood"]["threshold"] > 0
+    assert len(mc2["versions"]) == 2 and len(mc2["comparisons"]) == 1
+    # batch: two good images and one bad file
+    good = img.read_bytes()
+    b = c.post("/api/batch", files=[("images", ("a.png", good)), ("images", ("b.png", good)), ("images", ("c.exe", b"x"))])
+    assert b.status_code == 200, b.text
+    bj = b.json()
+    assert bj["summary"]["n"] == 3 and bj["summary"]["ok"] == 2 and bj["summary"]["failed"] == 1
+    assert c.post("/api/batch", files=[("images", (f"{i}.png", good)) for i in range(26)]).status_code == 400
+    # whole-slide mode on a larger image
+    from PIL import Image as PI
+    big = PI.new("RGB", (640, 640))
+    tile_src = PI.open(img).convert("RGB").resize((320, 320))
+    for x in (0, 320):
+        for y in (0, 320):
+            big.paste(tile_src, (x, y))
+    buf = io.BytesIO()
+    big.save(buf, "PNG")
+    sl = c.post("/api/slide", data={"tile": "320"}, files={"image": ("s.png", buf.getvalue())})
+    assert sl.status_code == 200, sl.text
+    sj = sl.json()
+    assert sj["mode"] == "slide" and sj["slide"]["n_tissue_tiles"] == 4 and len(sj["slide"]["tiles"]) == 4
+    assert c.get(sj["gradcam_url"]).status_code == 200 and c.get(f"/report/{sj['id']}").status_code == 200
+    tiny = io.BytesIO()
+    PI.new("RGB", (100, 100)).save(tiny, "PNG")
+    assert c.post("/api/slide", files={"image": ("t.png", tiny.getvalue())}).status_code == 400
+    # export
+    ex = c.get(f"/api/export?ids={rid},{sj['id']}")
+    assert ex.status_code == 200 and ex.text.splitlines()[0].startswith("id,") and len(ex.text.splitlines()) == 3
+    assert isinstance(c.get(f"/api/export?ids={rid}&format=json").json(), list)
+    assert c.get("/api/export").status_code == 401 and c.get("/api/export?ids=" + "0" * 32).status_code == 404
     assert c.post("/api/predict", data={}).status_code == 400
-    bad = c.post("/api/predict", data={"image": (io.BytesIO(b"x"), "a.exe")}, content_type="multipart/form-data")
+    bad = c.post("/api/predict", files={"image": ("a.exe", b"x")})
     assert bad.status_code == 400
-    bad = c.post("/api/predict", data={"image": (io.BytesIO(img.read_bytes()), "x.png"), "age": "999"},
-                 content_type="multipart/form-data")
+    bad = c.post("/api/predict", data={"age": "999"}, files={"image": ("x.png", img.read_bytes())})
     assert bad.status_code == 400
 
 
@@ -216,18 +273,30 @@ def test_chat_endpoint_and_retention(synth, tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     import os, time
-    from app.app import RateLimiter, create_app, purge_old
+    from fastapi.testclient import TestClient
+
+    from app.app import RateLimiter, create_app
     out = tmp_path / "out"
     out.mkdir()
-    old = out / "old.png"
-    old.write_bytes(b"x")
-    os.utime(old, (time.time() - 3 * 86400,) * 2)
-    purge_old(out, 24)
-    assert not old.exists()
     rl = RateLimiter(2)
     assert rl.allow("a") and rl.allow("a") and not rl.allow("a") and rl.allow("b")
     # chat works without trained models (assistant is independent of them)
-    c = create_app(tmp_path / "no-artifacts", out).test_client()
-    r = c.post("/api/chat", json={"message": "what are the limitations?", "result_id": "../../x"})
-    assert r.status_code == 200 and "pathologist" in r.get_json()["reply"]
-    assert c.post("/api/chat", data="not json", content_type="text/plain").status_code == 200
+    with TestClient(create_app(tmp_path / "no-artifacts", out)) as c:
+        r = c.post("/api/chat", json={"message": "what are the limitations?", "result_id": "../../x"})
+        assert r.status_code == 200 and "pathologist" in r.json()["reply"]
+        assert c.post("/api/chat", content="not json", headers={"content-type": "text/plain"}).status_code == 200
+
+
+def test_image_quality_flags_blank_and_non_he_images():
+    from PIL import Image as PI
+
+    from gastricsentinel.ood import image_quality
+    blank = image_quality(PI.new("RGB", (224, 224), (250, 250, 250)))
+    assert any("tissue" in f.lower() for f in blank["flags"])
+    green = image_quality(PI.new("RGB", (224, 224), (30, 200, 40)))
+    assert any("H&E" in f for f in green["flags"])
+    tiny = image_quality(PI.new("RGB", (32, 32), (200, 100, 160)))
+    assert any("small" in f for f in tiny["flags"])
+    rng = np.random.default_rng(0)
+    he = np.stack([rng.normal(220, 12, (224, 224)), rng.normal(120, 25, (224, 224)), rng.normal(180, 15, (224, 224))], 2).clip(0, 255).astype("uint8")
+    assert image_quality(PI.fromarray(he))["flags"] == []

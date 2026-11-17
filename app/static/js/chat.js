@@ -34,11 +34,19 @@
   addEventListener('keydown', (e) => { if (e.key === 'Escape' && panel.classList.contains('open')) close(); });
   form.addEventListener('submit', (e) => { e.preventDefault(); send(input.value); });
   SUGGEST.forEach((s) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = s; b.addEventListener('click', () => send(s)); sugg.append(b); });
-  document.addEventListener('gs:result', (e) => {
-    if (!e.detail || !e.detail.fresh) return;
-    if (!greeted) { greeted = true; add('Hi, I’m Sentinel. I can explain your result in plain language. I can’t diagnose or advise on treatment.', 'bot'); }
-    add('I’ve got your new result loaded. Ask me anything about it.', 'bot');
-    if (!panel.classList.contains('open')) setUnread(unread + 1);
+  const INTRO = 'Hi, I\u2019m Sentinel. I can explain your result, the confidence, the Grad-CAM map and the report in plain language. I can\u2019t diagnose anything or advise on treatment.';
+  document.addEventListener('gs:result', async (e) => {
+    const d = e.detail || {}, r = d.result; if (!r) return;
+    history.length = 0; msgs.replaceChildren(); greeted = true; add(INTRO, 'bot');
+    const owner = r.viewer && r.viewer.is_owner;
+    if (owner && !d.fresh && window.GS.api) {
+      try {
+        const j = await window.GS.api('/api/analyses/' + r.id + '/chat');
+        j.messages.forEach((m) => { add(m.content, m.role === 'user' ? 'me' : 'bot'); history.push({ role: m.role, content: m.content }); });
+        if (j.messages.length) add('Picking up where we left off. Ask me anything else about this result.', 'bot');
+      } catch { /* conversation unavailable; start fresh */ }
+    }
+    if (d.fresh) { add('I\u2019ve got your new result loaded. Ask me anything about it.', 'bot'); if (!panel.classList.contains('open')) setUnread(unread + 1); }
   });
   // keep the sheet above the on-screen keyboard on phones
   if (window.visualViewport) visualViewport.addEventListener('resize', () => { panel.style.maxHeight = panel.classList.contains('open') ? visualViewport.height * 0.95 + 'px' : ''; msgs.scrollTop = msgs.scrollHeight; });

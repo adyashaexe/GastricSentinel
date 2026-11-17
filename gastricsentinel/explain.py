@@ -8,11 +8,11 @@ from PIL import Image
 
 
 class GradCAM:
-    """Grad-CAM on a ResNet's last residual stage (model.layer4)."""
+    """Grad-CAM on the last convolutional stage (model.cam_layer, or ResNet layer4)."""
 
     def __init__(self, model, layer=None):
         self.model = model
-        self.layer = layer if layer is not None else model.layer4
+        self.layer = layer if layer is not None else getattr(model, "cam_layer", None) or model.layer4
         self._acts = self._grads = None
         self._h = self.layer.register_forward_hook(self._forward_hook)
 

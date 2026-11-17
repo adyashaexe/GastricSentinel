@@ -134,15 +134,22 @@ def make_splits(df: pd.DataFrame, val_frac=0.15, test_frac=0.15, seed=SEED,
     return df, info
 
 
-def get_transform(image_size: int, train: bool):
-    ops = [transforms.Resize((image_size, image_size))]
-    if train:
-        ops += [
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1),
-        ]
+def get_transform(image_size: int, train: bool, aug: str = "strong"):
+    """aug='light' keeps the original gentle augmentation; 'strong' adds scale/crop, rotation by any angle,
+    stronger stain-like colour jitter, occasional blur and greyscale (helps stain and scanner shift)."""
+    if not train:
+        ops = [transforms.Resize((image_size, image_size))]
+    elif aug == "light":
+        ops = [transforms.Resize((image_size, image_size)), transforms.RandomHorizontalFlip(),
+               transforms.RandomVerticalFlip(), transforms.RandomRotation(10),
+               transforms.ColorJitter(brightness=0.1, contrast=0.1)]
+    else:
+        ops = [transforms.RandomResizedCrop(image_size, scale=(0.6, 1.0), ratio=(0.85, 1.18)),
+               transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(),
+               transforms.RandomApply([transforms.RandomRotation(90)], p=0.5),
+               transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.3, hue=0.05),
+               transforms.RandomApply([transforms.GaussianBlur(5, (0.1, 1.5))], p=0.15),
+               transforms.RandomGrayscale(0.03)]
     ops += [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
     return transforms.Compose(ops)
 

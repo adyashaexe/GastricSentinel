@@ -171,7 +171,7 @@ def _header(report_id, stamp):
 
 # ------------------------------------------------------------------- build
 def build_report(result: dict, out_path, image_path=None, gradcam_path=None, report_id: str = "",
-                 model_card: dict | None = None, confusion_png=None) -> Path:
+                 model_card: dict | None = None, confusion_png=None, reliability_png=None, reviews=None) -> Path:
     S = _styles()
     now = datetime.now(timezone.utc)
     stamp = now.strftime("%Y-%m-%d %H:%M UTC")
@@ -257,6 +257,38 @@ def build_report(result: dict, out_path, image_path=None, gradcam_path=None, rep
         "validated segmentation of tumour, and a confident-looking heat-map can still be wrong. It has not been "
         "assessed by pathologists in this project.", S["just"]))
 
+    # ---- input quality / OOD / slide summary / expert review (all optional)
+    sl, ood = result.get("slide"), result.get("ood") or {}
+    if sl:
+        story.append(Paragraph("Whole-slide summary", S["h2"]))
+        story.append(_kv([("Image size", f"{sl['width']} x {sl['height']} px"), ("Tile size", f"{sl['tile']} px"),
+                          ("Tissue tiles classified", f"{sl['n_tissue_tiles']} of {sl['n_tiles']}"),
+                          ("Tiles predicted tumour (p > 0.5)", "n/a" if sl.get("tumour_fraction") is None else f"{sl['tumour_fraction']:.1%}"),
+                          ("Tiles unlike the training images", sl.get("ood_tiles", 0))], S))
+        story += [Spacer(1, 4), _tbl([["Class", "Tiles"]] + [[k, v] for k, v in sl["class_counts"].items()], [6 * cm, 3 * cm], align_right_from=1),
+                  Paragraph("The slide-level class is the highest mean tile probability. The overlay shades tiles by tumour probability. "
+                            "This aggregates independent patch predictions; it is not a slide-level diagnosis.", S["small"])]
+    if ood:
+        fd = ood.get("feature_distance")
+        rows = []
+        if fd:
+            rows.append(("Feature-space distance", f"{fd['score']:.1f} (flag threshold {fd['threshold']:.1f}; typical {fd['typical']:.1f})"))
+        for t in ood.get("flags") or []:
+            rows.append(("Flag", t))
+        if not sl:
+            story.append(Paragraph("Input and out-of-distribution check", S["h2"]))
+            story.append(_kv(rows or [("Result", "No input-quality or out-of-distribution flags were raised.")], S))
+    if reviews:
+        story.append(Paragraph("Expert review", S["h2"]))
+        lbl = {"agree": "Agrees with the model", "disagree": "Disagrees", "uncertain": "Unsure"}
+        for rv in reviews:
+            txt = f"<b>{rv['reviewer']}</b>: {lbl.get(rv['verdict'], rv['verdict'])}"
+            if rv.get("corrected_class"):
+                txt += f" (suggested class {rv['corrected_class']})"
+            if rv.get("note"):
+                txt += f". {rv['note']}"
+            story.append(Paragraph(txt + f" <font color='#667'>({rv['created'][:16].replace('T', ' ')} UTC)</font>", S["body"]))
+
     # ---- 4 clinical / genomic
     story.append(Paragraph("4. Clinical and genomic analysis", S["h1"]))
     ms = result.get("molecular_subtype")
@@ -319,6 +351,10 @@ def build_report(result: dict, out_path, image_path=None, gradcam_path=None, rep
         if confusion_png and Path(confusion_png).exists():
             story += [Spacer(1, 6), KeepTogether([Paragraph("Confusion matrix (test split)", S["h2"]),
                                                   Image(str(confusion_png), 9.5 * cm, 9.5 * cm, kind="proportional")])]
+        if reliability_png and Path(reliability_png).exists():
+            story += [Spacer(1, 6), KeepTogether([Paragraph("Reliability diagram (test split)", S["h2"]),
+                                                  Image(str(reliability_png), 8 * cm, 8 * cm, kind="proportional"),
+                                                  Paragraph("Points on the dashed line mean confidence equals accuracy; below it means overconfident.", S["small"])])]
     else:
         story.append(_callout("No validation artifacts were found next to the deployed model, so performance "
                               "figures cannot be shown. Do not rely on this model without evaluating it.", S,
@@ -350,7 +386,7 @@ def build_report(result: dict, out_path, image_path=None, gradcam_path=None, rep
     # ---- 7 limitations
     story.append(Paragraph("7. Limitations", S["h1"]))
     for b in ["Research prototype; not validated for clinical use and not a medical device.",
-              "Results describe a single image patch, not a whole slide or a patient.",
+              "Results describe an image patch (slide mode aggregates patches); neither is a slide-level or patient-level diagnosis.",
               "Trained on public datasets; performance on other scanners, stains or hospitals is unknown.",
               "Tumour-class probability is a model output, not a calibrated clinical risk.",
               "Grad-CAM and SHAP explain model behaviour and have not been validated by pathologists.",

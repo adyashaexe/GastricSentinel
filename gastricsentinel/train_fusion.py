@@ -106,7 +106,7 @@ def main():
     (ftr, ctr, gtr, ytr), (fva, cva, gva, yva), (fte, cte, gte, yte) = sel("train"), sel("val"), sel("test")
     ones = lambda n: torch.ones(n, 2)  # noqa: E731
 
-    net = FusionNet(len(classes), clin.shape[1], gen.shape[1]).to(device)
+    net = FusionNet(len(classes), clin.shape[1], gen.shape[1], img_dim=int(feats.shape[1])).to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=a.lr, weight_decay=1e-3)
     ce = nn.CrossEntropyLoss()
     dl = DataLoader(TensorDataset(ftr, ctr, gtr, ytr), batch_size=a.batch_size, shuffle=True,
@@ -143,7 +143,7 @@ def main():
     rows = []
     # baseline: the image model's own softmax head on identical test rows
     with torch.no_grad():
-        base = torch.softmax(model.fc(fte.to(device)), 1).cpu().numpy()
+        base = torch.softmax(model.head(fte.to(device)), 1).cpu().numpy()
     m0 = evaluate(yte.numpy(), base.argmax(1), classes, base)
     save_report(m0, out, "baseline_image_model_head", ctx)
     rows.append(("image_model_head (baseline)", m0))
@@ -163,7 +163,7 @@ def main():
 
     torch.save({
         "state_dict": {k: v.cpu() for k, v in best_state.items()},
-        "classes": classes, "clin_dim": int(clin.shape[1]), "gen_dim": int(gen.shape[1]),
+        "classes": classes, "clin_dim": int(clin.shape[1]), "gen_dim": int(gen.shape[1]), "img_dim": int(feats.shape[1]),
         "pairing_mode": a.pairing, "patient_level_correspondence": bool(summary["patient_level_correspondence"]),
     }, out / "fusion_model.pt")
     joblib.dump(prep, out / "fusion_preprocessor.joblib")
